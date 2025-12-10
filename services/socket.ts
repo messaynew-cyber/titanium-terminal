@@ -15,21 +15,24 @@ class SocketService {
       return import.meta.env.VITE_WS_URL;
     }
 
-    // 2. Dynamic Detection for Production (Northflank) vs Local
+    // 2. Dynamic Protocol & Host Detection
+    // CRITICAL FIX: Ensure WSS is used when page is HTTPS to prevent "Mixed Content" security errors.
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host; // e.g. "titanium-app.northflank.app"
+    const host = window.location.host;
     
-    // If we are on localhost:3000 (React dev server), we want to hit localhost:8000
-    if (host.includes('localhost:3000')) {
-        return 'ws://127.0.0.1:8000/ws';
-    }
-
-    // In production (Docker), React is served FROM Python on the same port, so we use the same host.
+    // In production (Docker), the backend serves the frontend, so relative path /ws works.
+    // In dev, Vite proxies /ws to the backend.
     return `${protocol}//${host}/ws`;
   }
 
   connect() {
     const url = this.getUrl();
+    
+    // Prevent duplicate connections
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
     try {
       console.log(`Connecting to Titanium Uplink: ${url}`);
       this.ws = new WebSocket(url);
@@ -52,11 +55,12 @@ class SocketService {
       this.ws.onclose = () => {
         console.log('🔴 Uplink Lost. Reconnecting...');
         this.notifyHandlers({ type: 'SYSTEM_STATUS', data: { isConnected: false } });
+        this.ws = null;
         this.retryConnection();
       };
 
       this.ws.onerror = (event) => {
-        console.warn('Titanium Uplink Connection Error');
+        console.warn('Titanium Uplink Connection Error. Check console for Mixed Content details.');
       };
     } catch (e) {
       console.error('Connection failed', e);
@@ -67,9 +71,13 @@ class SocketService {
   private retryConnection() {
     if (this.attempts < this.maxReconnectAttempts) {
       this.attempts++;
-      setTimeout(() => this.connect(), this.reconnectInterval);
+      const delay = this.reconnectInterval * Math.min(this.attempts, 3); // Exponential backoff cap at 9s
+      console.log(`Reconnecting attempt ${this.attempts}/${this.maxReconnectAttempts} in ${delay}ms...`);
+      setTimeout(() => this.connect(), delay);
     } else {
       console.error('Max reconnection attempts reached. Switching to Offline Mode.');
+      // Notify app that we are giving up
+      this.notifyHandlers({ type: 'SYSTEM_STATUS', data: { isConnected: false } });
     }
   }
 

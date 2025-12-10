@@ -29,8 +29,9 @@ const App: React.FC = () => {
       switch (msg.type) {
         case 'SYSTEM_STATUS':
           setSystemState(prev => {
-            // If we regain connection, disable simulation
-            if (msg.data.isConnected) setIsSimulated(false);
+            const connected = msg.data.isConnected;
+            // If we regain connection, disable simulation immediately
+            if (connected) setIsSimulated(false);
             return { ...prev, ...msg.data };
           });
           break;
@@ -52,7 +53,7 @@ const App: React.FC = () => {
       }
     });
 
-    // Watchdog: If no connection after 2s, start simulation
+    // Watchdog: If no connection after 7s (increased for production latency/cold starts), start simulation
     const watchdog = setTimeout(() => {
       if (!systemState.isConnected) {
         setIsSimulated(true);
@@ -60,18 +61,18 @@ const App: React.FC = () => {
             id: 'sim-init', 
             timestamp: new Date().toISOString(), 
             level: 'WARNING', 
-            message: 'UPLINK SEVERED. ENGAGING OFFLINE SIMULATION PROTOCOL.'
+            message: 'UPLINK TIMEOUT. ENGAGING OFFLINE SIMULATION PROTOCOL.'
         }]);
       }
-    }, 2000);
+    }, 7000);
 
     return () => {
       unsubscribe();
       clearTimeout(watchdog);
     };
-  }, [systemState.isConnected]); // Re-run if connection status changes actually triggers state updates
+  }, [systemState.isConnected]);
 
-  // Simulation Engine
+  // Simulation Engine (Client-side fallback)
   useEffect(() => {
     if (!isSimulated || systemState.isConnected) return;
 
@@ -126,8 +127,11 @@ const App: React.FC = () => {
       return;
     }
     
+    // In production/docker, relative path works because of proxy or same-origin
+    const apiUrl = '/api/force'; 
+    
     try {
-      await fetch(`http://localhost:8000/api/force/${side}`, { method: 'POST' });
+      await fetch(`${apiUrl}/${side}`, { method: 'POST' });
     } catch (e) {
       console.error("Failed to execute trade", e);
       setLogs(prev => [...prev, {
@@ -159,45 +163,80 @@ const App: React.FC = () => {
                  <button onClick={() => handleManualTrade('BUY')} className="px-4 py-2 bg-titanium-green/20 text-titanium-green border border-titanium-green/50 rounded hover:bg-titanium-green/30">FORCE BUY</button>
                  <button onClick={() => handleManualTrade('SELL')} className="px-4 py-2 bg-titanium-red/20 text-titanium-red border border-titanium-red/50 rounded hover:bg-titanium-red/30">FORCE SELL</button>
               </div>
-           </div>
-           
-           <table className="w-full text-left border-collapse">
-             <thead>
-               <tr className="text-slate-500 text-xs uppercase tracking-wider border-b border-white/10">
-                 <th className="p-3">Time</th>
-                 <th className="p-3">Symbol</th>
-                 <th className="p-3">Side</th>
-                 <th className="p-3">Qty</th>
-                 <th className="p-3">Price</th>
-                 <th className="p-3">Status</th>
-               </tr>
-             </thead>
-             <tbody className="font-mono text-sm">
-                {trades.length === 0 ? (
-                  <tr><td colSpan={6} className="p-8 text-center text-slate-600">No recent trades fetched.</td></tr>
-                ) : (
-                  trades.map((t) => (
-                    <tr key={t.id} className="border-b border-white/5 hover:bg-white/5">
-                      <td className="p-3 text-slate-400">{new Date(t.timestamp).toLocaleTimeString()}</td>
-                      <td className="p-3 font-bold text-titanium-gold">{t.symbol}</td>
-                      <td className={`p-3 font-bold ${t.side === 'buy' ? 'text-titanium-green' : 'text-titanium-red'}`}>{t.side.toUpperCase()}</td>
-                      <td className="p-3">{t.qty}</td>
-                      <td className="p-3">${t.price.toFixed(2)}</td>
-                      <td className="p-3"><span className="px-2 py-1 rounded bg-white/10 text-xs">{t.status}</span></td>
+              
+              <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="text-xs text-slate-500 uppercase tracking-wider border-b border-white/10">
+                      <th className="pb-3 pl-4">Time</th>
+                      <th className="pb-3">Symbol</th>
+                      <th className="pb-3">Side</th>
+                      <th className="pb-3">Qty</th>
+                      <th className="pb-3">Price</th>
+                      <th className="pb-3">Status</th>
                     </tr>
-                  ))
-                )}
-             </tbody>
-           </table>
+                  </thead>
+                  <tbody className="text-sm font-mono">
+                    {trades.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="py-4 text-center text-slate-600 italic">No trades executed today</td>
+                      </tr>
+                    )}
+                    {trades.map((trade) => (
+                      <tr key={trade.id} className="border-b border-white/5 hover:bg-white/5 transition-colors">
+                        <td className="py-3 pl-4 text-slate-400">{new Date(trade.timestamp).toLocaleTimeString()}</td>
+                        <td className="py-3 font-bold text-white">{trade.symbol}</td>
+                        <td className={`py-3 ${trade.side === 'buy' ? 'text-titanium-green' : 'text-titanium-red'}`}>
+                          {trade.side.toUpperCase()}
+                        </td>
+                        <td className="py-3 text-slate-300">{trade.qty}</td>
+                        <td className="py-3 text-slate-300">${trade.price.toFixed(2)}</td>
+                        <td className="py-3">
+                          <span className={`px-2 py-1 rounded text-xs ${
+                            trade.status === 'filled' ? 'bg-titanium-green/10 text-titanium-green' : 'bg-slate-800 text-slate-400'
+                          }`}>
+                            {trade.status.toUpperCase()}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+           </div>
         </div>
       )}
 
-      {/* Placeholder views for others */}
-      {['strategy', 'risk', 'settings'].includes(activeView) && (
-        <div className="flex flex-col items-center justify-center h-[60vh] text-slate-600">
-          <Activity size={64} className="mb-4 opacity-20" />
-          <p className="text-xl">Module Under Construction</p>
-          <p className="text-sm">Connect backend to unlock {activeView} data streams.</p>
+      {activeView === 'strategy' && (
+        <div className="glass-panel p-8 flex items-center justify-center h-full">
+           <div className="text-center">
+              <Activity className="w-16 h-16 text-titanium-gold mx-auto mb-4 opacity-50" />
+              <h2 className="text-2xl font-bold text-white mb-2">HMM STRATEGY MATRIX</h2>
+              <p className="text-slate-500 max-w-md mx-auto">
+                Hidden Markov Model parameters and transition probabilities are calculated server-side. 
+                Adjust hyperparameters in <code>backend/main.py</code>.
+              </p>
+           </div>
+        </div>
+      )}
+      
+      {activeView === 'risk' && (
+        <div className="glass-panel p-8 flex items-center justify-center h-full">
+           <div className="text-center">
+              <Activity className="w-16 h-16 text-titanium-red mx-auto mb-4 opacity-50" />
+              <h2 className="text-2xl font-bold text-white mb-2">RISK MANAGEMENT</h2>
+              <p className="text-slate-500">Global stop-loss and position sizing controls.</p>
+           </div>
+        </div>
+      )}
+
+      {activeView === 'settings' && (
+        <div className="glass-panel p-8 flex items-center justify-center h-full">
+           <div className="text-center">
+              <Activity className="w-16 h-16 text-slate-500 mx-auto mb-4 opacity-50" />
+              <h2 className="text-2xl font-bold text-white mb-2">SYSTEM CONFIG</h2>
+              <p className="text-slate-500">API Keys and Network preferences.</p>
+           </div>
         </div>
       )}
     </Layout>
