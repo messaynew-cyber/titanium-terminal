@@ -15,12 +15,16 @@ class SocketService {
       return import.meta.env.VITE_WS_URL;
     }
 
-    // 2. Dynamic Detection
+    // 2. Dynamic Detection for Production (Northflank) vs Local
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host; // e.g. "titanium-app.northflank.app" or "localhost:3000"
+    const host = window.location.host; // e.g. "titanium-app.northflank.app"
     
-    // In development (localhost), we usually proxy to port 8000, 
-    // but in production, we connect to the same host.
+    // If we are on localhost:3000 (React dev server), we want to hit localhost:8000
+    if (host.includes('localhost:3000')) {
+        return 'ws://127.0.0.1:8000/ws';
+    }
+
+    // In production (Docker), React is served FROM Python on the same port, so we use the same host.
     return `${protocol}//${host}/ws`;
   }
 
