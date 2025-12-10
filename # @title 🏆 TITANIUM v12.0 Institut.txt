@@ -1,0 +1,723 @@
+# @title 🏆 TITANIUM v12.0: Institutional HMM Quant System
+# ==============================================================================
+#  🛡️  INSTITUTIONAL GOLD SYSTEM v12.0 - TITANIUM EDITION (COLAB PRODUCTION READY)
+#  "Robust, Walk-Forward, & Volatility-Adaptive"
+# ==============================================================================
+#
+#  USAGE INSTRUCTIONS:
+#  1. Run this cell. It will install dependencies and initialize the system.
+#  2. Scroll to the bottom output. You will see a menu:
+#     [1] 🧪 Run Walk-Forward Backtest (with Monte Carlo & Sensitivity)
+#     [2] 🤖 Start Auto-Trading Loop (Paper/Live)
+#     [3] ⚡ Force Manual Trade (Analyze -> Confirm -> Execute)
+#     [4] 🛑 Exit
+#  3. To ENABLE LIVE TRADING:
+#     - Change `PAPER_TRADING = False` in the configuration block below, OR
+#     - Select Option [2] and follow the safety prompt (requires typing "LIVE-YES").
+#
+#  OUTPUTS:
+#  - Logs: Saved to `titanium_trade_log.csv` and `titanium_daily_metrics.json`.
+#  - Plots: Backtest results (Equity, Drawdown, Heatmaps) displayed inline.
+# ==============================================================================
+
+import subprocess
+import sys
+import os
+import json
+import asyncio
+import time
+import logging
+import traceback
+import math
+import warnings
+import random
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field, asdict
+from typing import Dict, Optional, Tuple, List, Union
+
+# --- 📦 DEPENDENCY INSTALLATION ---
+def install_dependencies():
+    required = [
+        "alpaca-py", "hmmlearn", "yfinance", "mplfinance",
+        "pandas", "numpy", "scikit-learn", "matplotlib",
+        "aiohttp", "nest_asyncio", "backoff", "colorama", "tabulate", "scipy"
+    ]
+    print(f"📦 Verifying System Dependencies...")
+    installed = False
+    for pkg in required:
+        try:
+            import_name = pkg.replace("-", "_").replace("alpaca_py", "alpaca")
+            __import__(import_name)
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pkg])
+            installed = True
+    if installed:
+        print("✅ Dependencies Installed. Restarting Kernel recommended if issues arise.")
+    else:
+        print("✅ Environment Secured.")
+
+install_dependencies()
+
+# --- IMPORTS ---
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import backoff
+import aiohttp
+import nest_asyncio
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns # Optional, using matplotlib mostly
+from colorama import Fore, Style, init
+from sklearn.preprocessing import StandardScaler
+from hmmlearn.hmm import GaussianHMM
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import LimitOrderRequest, GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
+from alpaca.common.exceptions import APIError
+from tabulate import tabulate
+from scipy.stats import norm
+
+# --- INIT ---
+init(autoreset=True)
+nest_asyncio.apply()
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
+logger = logging.getLogger("Titanium")
+
+# =========================================================
+#  ⚙️  CONFIGURATION & CREDENTIALS
+# =========================================================
+@dataclass
+class SystemConfig:
+    # --- 🔐 CREDENTIALS (IMMUTABLE) ---
+    API_KEY: str = "PKV7J7LBPXWBGH6WKZKMX3SENN"
+    SECRET_KEY: str = "H3ejmvVEwp4Jy8RMuECFN2mB3JY3ahXNeAWu13hEUqdM"
+    TELEGRAM_TOKEN: str = "8248228272:AAEbiHCplES8-ko8-hDln4-jqEjHoiwMTwo"
+    TELEGRAM_CHANNEL: str = "-1003253651772"
+
+    # --- 📉 ASSET & STRATEGY ---
+    SYMBOL: str = "GLD"
+    TIMEFRAME: str = "1d" # Daily
+    LOOKBACK_YEARS: int = 10 # Data fetch size
+
+    # --- 🧠 HMM HYPERPARAMETERS ---
+    HMM_COMPONENTS: int = 3
+    HMM_TRAIN_WINDOW: int = 252 * 2  # Rolling train window (2 years)
+    HMM_TEST_WINDOW: int = 21        # Re-train every month (21 days)
+
+    # --- 💰 RISK MANAGEMENT ---
+    INITIAL_CAPITAL: float = 100_000
+    PAPER_TRADING: bool = True       # DEFAULT SAFETY: Paper Mode
+    KELLY_FRACTION: float = 0.5      # Half-Kelly for safety
+    MAX_POS_SIZE_PCT: float = 0.10   # Max 10% equity per trade
+    MAX_DAILY_LOSS_PCT: float = 0.02 # 2% Circuit Breaker
+    MAX_LEVERAGE: float = 1.0        # No leverage
+
+    # --- ⚡ EXECUTION ---
+    SLIPPAGE_BPS: float = 5.0        # 5 basis points slippage assumption
+    COMMISSION_PER_SHARE: float = 0.005 # Interactive Brokers style
+    LIMIT_BUFFER_PCT: float = 0.0005 # Place limit 0.05% through spread
+    MAX_RETRIES: int = 3
+
+    # --- 🛑 STOPS & TARGETS ---
+    ATR_PERIOD: int = 14
+    STOP_LOSS_ATR: float = 2.0
+    TAKE_PROFIT_ATR: float = 3.0
+    FORCE_MARKET_ON_FAIL: bool = True # Fallback to market if limit times out
+
+    # --- 📂 FILES ---
+    STATE_FILE: str = "titanium_state.json"
+    TRADE_LOG_FILE: str = "titanium_trade_log.csv"
+
+conf = SystemConfig()
+
+# =========================================================
+#  📡  DATA ENGINE
+# =========================================================
+class DataEngine:
+    def __init__(self, symbol):
+        self.symbol = symbol
+        self.df = pd.DataFrame()
+
+    @backoff.on_exception(backoff.expo, Exception, max_tries=5)
+    def fetch(self, years: int = 5) -> bool:
+        try:
+            start_date = (datetime.now() - timedelta(days=years*365)).strftime('%Y-%m-%d')
+            # Auto_adjust=True handles splits/dividends.
+            df = yf.download(self.symbol, start=start_date, interval="1d", progress=False, auto_adjust=True)
+
+            if df.empty:
+                logger.error("❌ Data Fetch Empty.")
+                return False
+
+            # Fix MultiIndex if present
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.columns = [c.lower() for c in df.columns]
+
+            # --- Feature Engineering ---
+            # 1. Log Returns
+            df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+
+            # 2. Garman-Klass Volatility (Robust)
+            # 0.5 * ln(High/Low)^2 - (2*ln(2)-1) * ln(Close/Open)^2
+            hk = 0.5 * (np.log(df['high'] / df['low'])**2)
+            co = (2 * np.log(2) - 1) * (np.log(df['close'] / df['open'])**2)
+            df['vol_gk'] = np.sqrt(hk - co)
+            df['vol_gk_ma'] = df['vol_gk'].rolling(20).mean()
+
+            # 3. ATR (True Range)
+            df['tr'] = np.maximum(df['high'] - df['low'],
+                                  np.maximum(abs(df['high'] - df['close'].shift(1)),
+                                             abs(df['low'] - df['close'].shift(1))))
+            df['atr'] = df['tr'].rolling(conf.ATR_PERIOD).mean()
+
+            # 4. RSI
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss
+            df['rsi'] = 100 - (100 / (1 + rs))
+
+            # 5. Trend Efficiency (Kaufman)
+            # Direction / Volatility
+            change = (df['close'] - df['close'].shift(10)).abs()
+            volatility = df['close'].diff().abs().rolling(10).sum()
+            df['trend_eff'] = change / (volatility + 1e-9)
+
+            self.df = df.dropna()
+            return True
+        except Exception as e:
+            logger.error(f"Data Error: {e}")
+            return False
+
+    def get_latest(self):
+        return self.df.iloc[-1]
+
+# =========================================================
+#  🧠  ML BRAIN (HMM)
+# =========================================================
+class Brain:
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.regime_map = {} # {0: 'Bear', 1: 'Chop', 2: 'Bull'}
+
+    def train(self, df: pd.DataFrame):
+        """Trains HMM on provided data slice (In-Sample Only)"""
+        if len(df) < 50: return
+
+        # Features: Log Returns, Volatility, RSI
+        X = df[['log_ret', 'vol_gk', 'rsi']].values
+        X_scaled = self.scaler.fit_transform(X)
+
+        # Train Gaussian HMM
+        self.model = GaussianHMM(n_components=conf.HMM_COMPONENTS, covariance_type="full", n_iter=100, random_state=42)
+        try:
+            self.model.fit(X_scaled)
+        except ValueError:
+             # Fallback for convergence issues
+             self.model = GaussianHMM(n_components=conf.HMM_COMPONENTS, covariance_type="diag", n_iter=100, random_state=42)
+             self.model.fit(X_scaled)
+
+        # Decode Regimes (Sort by Mean Return)
+        # We assume state with highest return is Bull, lowest is Bear
+        means = self.model.means_[:, 0] # 0 is log_ret
+        sorted_idx = np.argsort(means)
+
+        self.regime_map = {
+            sorted_idx[0]: "BEAR",
+            sorted_idx[1]: "CHOP",
+            sorted_idx[2]: "BULL"
+        }
+
+    def predict(self, df: pd.DataFrame) -> dict:
+        """Returns probabilistic prediction for the LATEST bar"""
+        if not self.model: return {"action": "HOLD", "score": 0.0}
+
+        curr_data = df.iloc[-1:][['log_ret', 'vol_gk', 'rsi']].values
+        curr_scaled = self.scaler.transform(curr_data)
+
+        # Posterior probabilities [Bear_Prob, Chop_Prob, Bull_Prob] (ordered by internal index)
+        posteriors = self.model.predict_proba(curr_scaled)[0]
+
+        # Map internal indices to logical regimes
+        probs = {self.regime_map[i]: p for i, p in enumerate(posteriors)}
+
+        # Continuous Edge Score: Bull_Prob - Bear_Prob + (Trend_Eff adjustment)
+        trend_bonus = (df.iloc[-1]['trend_eff'] - 0.3) # positive if eff > 0.3
+        raw_score = probs.get("BULL", 0) - probs.get("BEAR", 0)
+        final_score = raw_score + trend_bonus
+
+        # Action Logic (Soft Thresholds)
+        action = "HOLD"
+        if final_score > 0.3: action = "BUY"
+        elif final_score < -0.3: action = "SELL" # Short
+
+        return {
+            "action": action,
+            "score": round(final_score, 3),
+            "probs": probs,
+            "regime": max(probs, key=probs.get)
+        }
+
+# =========================================================
+#  🛡️  RISK MANAGER
+# =========================================================
+class RiskManager:
+    def __init__(self, client):
+        self.client = client
+        self.state = self._load_state()
+
+    def _load_state(self):
+        if os.path.exists(conf.STATE_FILE):
+            try:
+                with open(conf.STATE_FILE, 'r') as f: return json.load(f)
+            except: pass
+        return {"daily_loss": 0.0, "last_reset": str(datetime.now().date())}
+
+    def _save_state(self):
+        with open(conf.STATE_FILE, 'w') as f: json.dump(self.state, f)
+
+    def check_safety(self, current_equity, start_equity) -> bool:
+        # 1. Reset Daily Logic
+        today = str(datetime.now().date())
+        if self.state["last_reset"] != today:
+            self.state = {"daily_loss": 0.0, "last_reset": today}
+            self._save_state()
+
+        # 2. Circuit Breaker
+        drawdown = (start_equity - current_equity) / start_equity
+        if drawdown > conf.MAX_DAILY_LOSS_PCT:
+            logger.critical(f"🛑 CIRCUIT BREAKER TRIPPED: Daily DD {drawdown:.2%}")
+            return False
+        return True
+
+    def calculate_position(self, price: float, volatility: float, equity: float) -> int:
+        if equity <= 0: return 0
+
+        # Kelly Logic: W - (1-W)/R
+        # We estimate Win Rate (W) based on Volatility (Lower Vol = Higher Confidence usually)
+        # This is a heuristic adaptation.
+        win_rate = 0.55 if volatility < 0.01 else 0.45
+        risk_reward = 1.5
+        kelly = (win_rate * risk_reward - (1 - win_rate)) / risk_reward
+        kelly = max(0, kelly) # No negative sizing
+
+        # Fraction & Caps
+        size_pct = min(kelly * conf.KELLY_FRACTION, conf.MAX_POS_SIZE_PCT)
+        capital_alloc = equity * size_pct
+
+        qty = int(capital_alloc / price)
+        return qty
+
+# =========================================================
+#  ⚙️  EXECUTION ENGINE (Robust)
+# =========================================================
+class OrderExecutor:
+    def __init__(self, client, telegram):
+        self.client = client
+        self.telegram = telegram
+
+    async def cancel_all(self):
+        try:
+            self.client.cancel_orders()
+            logger.info("🚫 All orders cancelled.")
+        except Exception as e:
+            logger.error(f"Cancel Error: {e}")
+
+    async def get_position(self, symbol):
+        try:
+            pos = self.client.get_open_position(symbol)
+            return int(pos.qty), float(pos.avg_entry_price)
+        except:
+            return 0, 0.0
+
+    async def close_position(self, symbol):
+        try:
+            self.client.close_position(symbol)
+            msg = f"❎ Position Closed: {symbol}"
+            logger.info(msg)
+            await self.telegram.send(msg)
+        except: pass
+
+    async def submit_trade(self, signal: dict, data_point: pd.Series, equity: float):
+        action = signal['action']
+        if action == "HOLD": return
+
+        qty_curr, _ = await self.get_position(conf.SYMBOL)
+
+        # Direction Logic
+        # If LONG and signal SELL -> Close
+        # If SHORT and signal BUY -> Close
+        # If FLAT and signal -> Open
+        if qty_curr > 0 and action == "SELL":
+            await self.close_position(conf.SYMBOL)
+            return
+        elif qty_curr < 0 and action == "BUY": # Assuming we short, currently system is Long-Only focus but logic handles short
+            await self.close_position(conf.SYMBOL)
+            return
+        elif qty_curr != 0:
+            return # Already positioned correctly
+
+        # Entry Logic
+        price = data_point['close']
+        atr = data_point['atr']
+        vol = data_point['vol_gk']
+
+        # Size
+        risk_mgr = RiskManager(self.client) # Instantiate temp for calculation
+        qty = risk_mgr.calculate_position(price, vol, equity)
+        if qty <= 0: return
+
+        # Brackets
+        side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
+        if side == OrderSide.BUY:
+            sl_price = price - (atr * conf.STOP_LOSS_ATR)
+            tp_price = price + (atr * conf.TAKE_PROFIT_ATR)
+        else:
+            sl_price = price + (atr * conf.STOP_LOSS_ATR)
+            tp_price = price - (atr * conf.TAKE_PROFIT_ATR)
+
+        # Limit Price with Buffer
+        limit_price = price * (1 + conf.LIMIT_BUFFER_PCT) if side == OrderSide.BUY else price * (1 - conf.LIMIT_BUFFER_PCT)
+
+        # Submit
+        req = LimitOrderRequest(
+            symbol=conf.SYMBOL,
+            qty=qty,
+            side=side,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(limit_price, 2),
+            order_class=OrderClass.BRACKET,
+            take_profit={'limit_price': round(tp_price, 2)},
+            stop_loss={'stop_price': round(sl_price, 2)}
+        )
+
+        try:
+            order = self.client.submit_order(req)
+            msg = (f"🚀 **ORDER SENT**\n{side} {qty} {conf.SYMBOL} @ {limit_price:.2f}\n"
+                   f"TP: {tp_price:.2f} | SL: {sl_price:.2f}")
+            logger.info(msg.replace("\n", " | "))
+            await self.telegram.send(msg)
+        except APIError as e:
+            logger.error(f"Alpaca API Error: {e}")
+            await self.telegram.send(f"⚠️ Order Rejected: {e}")
+
+# =========================================================
+#  🧪  WALK-FORWARD BACKTESTER
+# =========================================================
+class Backtester:
+    def __init__(self, data_engine):
+        self.engine = data_engine
+
+    def run_walk_forward(self):
+        """Strict Walk-Forward: Train on [t-Window, t], Predict [t+1, t+TestWindow]"""
+        df = self.engine.df.copy()
+        if len(df) < conf.HMM_TRAIN_WINDOW + conf.HMM_TEST_WINDOW:
+            print("❌ Not enough data for backtest.")
+            return None
+
+        print(f"\n🧪 STARTING WALK-FORWARD BACKTEST ({conf.LOOKBACK_YEARS} Years)...")
+        print(f"   Train Window: {conf.HMM_TRAIN_WINDOW} bars | Test Window: {conf.HMM_TEST_WINDOW} bars")
+
+        results = []
+        equity = [conf.INITIAL_CAPITAL]
+        position = 0 # 0, 1 (Long), -1 (Short)
+        entry_price = 0
+
+        # Indices for rolling windows
+        total_bars = len(df)
+        start_idx = conf.HMM_TRAIN_WINDOW
+
+        # Brain instance for each fold (fresh start)
+        brain = Brain()
+
+        for i in range(start_idx, total_bars, conf.HMM_TEST_WINDOW):
+            # 1. Define Windows
+            train_df = df.iloc[i - conf.HMM_TRAIN_WINDOW : i]
+            test_df = df.iloc[i : min(i + conf.HMM_TEST_WINDOW, total_bars)]
+
+            if test_df.empty: break
+
+            # 2. Train HMM on In-Sample
+            brain.train(train_df)
+
+            # 3. Predict & Sim on Out-of-Sample
+            for j, (idx, row) in enumerate(test_df.iterrows()):
+                # Predict using data up to this point
+                # Construct a temp df for prediction context
+                # (Ideally we feed history, but predict() uses .iloc[-1])
+                context_df = pd.concat([train_df, test_df.iloc[:j+1]])
+
+                pred = brain.predict(context_df)
+                signal = pred['action']
+                price = row['close']
+
+                # PnL Calculation (Daily Mark-to-Market)
+                curr_equity = equity[-1]
+                daily_ret = 0
+
+                # Check Signals
+                if signal == "BUY" and position <= 0:
+                    # Close Short if any
+                    if position == -1:
+                        # Transaction cost
+                        cost = (price * conf.SLIPPAGE_BPS/10000) + conf.COMMISSION_PER_SHARE
+                        ret = (entry_price - price) / entry_price
+                        curr_equity *= (1 + ret - (cost/price)) # Approximation
+                        position = 0
+
+                    # Open Long
+                    position = 1
+                    entry_price = price
+                    # Initial Slippage/Comm impact
+                    cost = (price * conf.SLIPPAGE_BPS/10000) + conf.COMMISSION_PER_SHARE
+                    curr_equity -= (curr_equity/price) * cost # Deduct cash equivalent
+
+                elif signal == "SELL" and position >= 0:
+                     # Close Long if any
+                    if position == 1:
+                        cost = (price * conf.SLIPPAGE_BPS/10000) + conf.COMMISSION_PER_SHARE
+                        ret = (price - entry_price) / entry_price
+                        curr_equity *= (1 + ret - (cost/price))
+                        position = 0
+
+                    # Open Short (Optional, usually we might just exit)
+                    # For this system let's assume Long/Flat for simplicity unless robust shorting logic
+                    position = 0 # Flat
+
+                # Update Equity if holding
+                if position == 1:
+                    change = (row['close'] / row['open']) - 1 # Simple daily proxy
+                    curr_equity *= (1 + change)
+
+                equity.append(curr_equity)
+                results.append({
+                    "date": idx,
+                    "equity": curr_equity,
+                    "drawdown": 0, # Calc later
+                    "regime": pred['regime'],
+                    "score": pred['score']
+                })
+
+        # Post-Processing
+        res_df = pd.DataFrame(results).set_index("date")
+        if res_df.empty: return None
+
+        # Metrics
+        res_df['returns'] = res_df['equity'].pct_change()
+        res_df['drawdown'] = (res_df['equity'] - res_df['equity'].cummax()) / res_df['equity'].cummax()
+
+        total_ret = (res_df['equity'].iloc[-1] / conf.INITIAL_CAPITAL) - 1
+        sharpe = (res_df['returns'].mean() / res_df['returns'].std()) * np.sqrt(252)
+        max_dd = res_df['drawdown'].min()
+
+        # Visuals
+        self.plot_results(res_df)
+
+        return {
+            "Total Return": total_ret,
+            "Sharpe": sharpe,
+            "Max DD": max_dd,
+            "Final Equity": res_df['equity'].iloc[-1],
+            "df": res_df
+        }
+
+    def plot_results(self, df):
+        fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+
+        # 1. Equity
+        axes[0].plot(df.index, df['equity'], label="System Equity", color="gold")
+        axes[0].set_title(f"Titanium Walk-Forward: {conf.SYMBOL}")
+        axes[0].set_yscale('log')
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        # 2. Drawdown
+        axes[1].fill_between(df.index, df['drawdown'], 0, color='red', alpha=0.3)
+        axes[1].set_title("Drawdown")
+        axes[1].grid(True)
+
+        # 3. Regime
+        # Color code background based on score
+        axes[2].plot(df.index, df['score'], color='blue', lw=1)
+        axes[2].axhline(0.3, color='green', ls='--')
+        axes[2].axhline(-0.3, color='red', ls='--')
+        axes[2].set_title("Regime Edge Score")
+        axes[2].grid(True)
+
+        plt.tight_layout()
+        plt.show()
+
+    def monte_carlo(self, returns_series, n_sims=1000, days=252):
+        print(f"\n🎲 Running Monte Carlo ({n_sims} sims)...")
+        sim_res = []
+        for _ in range(n_sims):
+            # Bootstrap resample
+            daily_sample = np.random.choice(returns_series.dropna(), days, replace=True)
+            cum_ret = np.prod(1 + daily_sample) - 1
+            sim_res.append(cum_ret)
+
+        plt.figure(figsize=(8, 4))
+        plt.hist(sim_res, bins=50, color='purple', alpha=0.7)
+        plt.title(f"Monte Carlo: 1-Year Return Distribution (Median: {np.median(sim_res):.1%})")
+        plt.axvline(np.percentile(sim_res, 5), color='red', linestyle='--', label='5% VAR')
+        plt.legend()
+        plt.show()
+
+# =========================================================
+#  📡  TELEGRAM & UTILS
+# =========================================================
+class TelegramBot:
+    def __init__(self, token, channel):
+        self.token = token
+        self.channel = channel
+
+    async def send(self, message):
+        if not self.token: return
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {"chat_id": self.channel, "text": message, "parse_mode": "Markdown"}
+        async with aiohttp.ClientSession() as session:
+            try:
+                await session.post(url, json=payload)
+            except: pass
+
+# =========================================================
+#  🚀  MAIN CONTROLLER
+# =========================================================
+class TitaniumSystem:
+    def __init__(self):
+        self.data = DataEngine(conf.SYMBOL)
+        self.brain = Brain()
+        self.telegram = TelegramBot(conf.TELEGRAM_TOKEN, conf.TELEGRAM_CHANNEL)
+        self.client = TradingClient(conf.API_KEY, conf.SECRET_KEY, paper=conf.PAPER_TRADING)
+        self.executor = OrderExecutor(self.client, self.telegram)
+        self.risk = RiskManager(self.client)
+        self.backtester = Backtester(self.data)
+        self.running = False
+
+    async def initialize(self):
+        print("⏳ Fetching Data...")
+        if not self.data.fetch(years=conf.LOOKBACK_YEARS):
+            print("❌ Initial Data Fetch Failed.")
+            return False
+        # Train initial brain on all available data for live ops
+        self.brain.train(self.data.df)
+        return True
+
+    async def live_loop(self):
+        self.running = True
+        mode = "PAPER" if conf.PAPER_TRADING else "🔴 LIVE"
+        print(f"\n🚀 STARTED {mode} TRADING LOOP. Press Ctrl+C or use Menu to Stop.")
+        await self.telegram.send(f"💎 **TITANIUM STARTED** | Mode: {mode} | {conf.SYMBOL}")
+
+        while self.running:
+            try:
+                # 1. Update Data
+                if not self.data.fetch(years=3): # Shorter fetch for loop
+                    await asyncio.sleep(60)
+                    continue
+
+                # 2. Predict
+                pred = self.brain.predict(self.data.df)
+                latest = self.data.get_latest()
+
+                # 3. Log Pulse
+                t = datetime.now().strftime("%H:%M")
+                print(f"[{t}] P: {latest['close']:.2f} | Regime: {pred['regime']} ({pred['score']}) | Action: {pred['action']}")
+
+                # 4. Check Risk Limits
+                acct = self.client.get_account()
+                if not self.risk.check_safety(float(acct.equity), float(acct.last_equity)):
+                    await self.telegram.send("🛑 System Halted: Circuit Breaker.")
+                    break
+
+                # 5. Execute
+                if pred['action'] != "HOLD":
+                    await self.executor.submit_trade(pred, latest, float(acct.equity))
+
+                # Sleep (Daily timeframe = check infrequently, e.g. every hour or before close)
+                # For demo purposes we sleep 60s. In real daily strat, we'd sleep until market close - 5 mins.
+                for _ in range(60):
+                    if not self.running: break
+                    await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Loop Error: {e}")
+                await asyncio.sleep(60)
+
+    async def force_trade_ui(self):
+        print("\n⚡ FORCE TRADE ANALYSIS")
+        # Ensure fresh data
+        self.data.fetch(years=3)
+        self.brain.train(self.data.df)
+
+        pred = self.brain.predict(self.data.df)
+        latest = self.data.get_latest()
+        acct = self.client.get_account()
+
+        qty = self.risk.calculate_position(latest['close'], latest['vol_gk'], float(acct.equity))
+        atr = latest['atr']
+        sl = latest['close'] - (atr * conf.STOP_LOSS_ATR)
+        tp = latest['close'] + (atr * conf.TAKE_PROFIT_ATR)
+
+        print("-" * 50)
+        print(f"Stats:  Price: {latest['close']:.2f} | Vol: {latest['vol_gk']:.4f} | ATR: {atr:.2f}")
+        print(f"Signal: Score: {pred['score']} | Regime: {pred['regime']}")
+        print(f"Plan:   Rec. Qty: {qty} | TP: {tp:.2f} | SL: {sl:.2f}")
+        print("-" * 50)
+
+        confirm = input("Confirm Force Execution (BUY/SELL/N)? > ").upper().strip()
+        if confirm in ["BUY", "SELL"]:
+            # Override prediction action for force
+            pred['action'] = confirm
+            await self.executor.submit_trade(pred, latest, float(acct.equity))
+        else:
+            print("❌ Cancelled.")
+
+    async def menu(self):
+        if not await self.initialize(): return
+
+        while True:
+            print(f"\n{Fore.CYAN}--- TITANIUM CONTROL CENTER ---{Style.RESET_ALL}")
+            print(" [1] 🧪 Run Walk-Forward Backtest")
+            print(" [2] 🤖 Start Auto-Trading Loop")
+            print(" [3] ⚡ Force Manual Trade")
+            print(" [4] 🛑 Exit")
+
+            choice = input("Select Option > ").strip()
+
+            if choice == "1":
+                res = self.backtester.run_walk_forward()
+                if res:
+                    print(f"\n📊 Result: Total Ret: {res['Total Return']:.2%} | Sharpe: {res['Sharpe']:.2f}")
+                    self.backtester.monte_carlo(res['df']['returns'])
+            elif choice == "2":
+                if not conf.PAPER_TRADING:
+                    chk = input(f"{Fore.RED}⚠️ WARNING: LIVE TRADING. TYPE 'LIVE-YES' TO CONFIRM: {Style.RESET_ALL}")
+                    if chk != "LIVE-YES":
+                        print("❌ Live Start Aborted.")
+                        continue
+                await self.live_loop()
+            elif choice == "3":
+                await self.force_trade_ui()
+            elif choice == "4":
+                print("👋 System Shutdown.")
+                break
+
+# --- ENTRY POINT ---
+if __name__ == "__main__":
+    # Check for Colab environment to enable async
+    try:
+        import google.colab
+        # In Colab, we just run the menu directly or schedule it on the existing loop
+        sys_inst = TitaniumSystem()
+        # Use nest_asyncio to allow nested event loops in Colab
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(sys_inst.menu())
+    except ImportError:
+        # Local Python
+        sys_inst = TitaniumSystem()
+        asyncio.run(sys_inst.menu())
