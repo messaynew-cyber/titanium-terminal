@@ -6,18 +6,33 @@ class SocketService {
   private ws: WebSocket | null = null;
   private handlers: Set<MessageHandler> = new Set();
   private reconnectInterval: number = 3000;
+  private maxReconnectAttempts: number = 5;
+  private attempts: number = 0;
   
-  // Safely access env with optional chaining to prevent runtime crashes if env is undefined
-  // Use VITE_WS_URL if available (production), otherwise fallback to localhost (dev)
-  private url: string = import.meta.env?.VITE_WS_URL || 'ws://localhost:8000/ws';
+  private getUrl(): string {
+    // 1. If explicitly set in environment
+    if (import.meta.env?.VITE_WS_URL) {
+      return import.meta.env.VITE_WS_URL;
+    }
+
+    // 2. Dynamic Detection
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host; // e.g. "titanium-app.northflank.app" or "localhost:3000"
+    
+    // In development (localhost), we usually proxy to port 8000, 
+    // but in production, we connect to the same host.
+    return `${protocol}//${host}/ws`;
+  }
 
   connect() {
+    const url = this.getUrl();
     try {
-      console.log(`Connecting to Titanium Uplink: ${this.url}`);
-      this.ws = new WebSocket(this.url);
+      console.log(`Connecting to Titanium Uplink: ${url}`);
+      this.ws = new WebSocket(url);
 
       this.ws.onopen = () => {
         console.log('⚡ TITANIUM Uplink Established');
+        this.attempts = 0;
         this.notifyHandlers({ type: 'SYSTEM_STATUS', data: { isConnected: true } });
       };
 
@@ -33,17 +48,24 @@ class SocketService {
       this.ws.onclose = () => {
         console.log('🔴 Uplink Lost. Reconnecting...');
         this.notifyHandlers({ type: 'SYSTEM_STATUS', data: { isConnected: false } });
-        setTimeout(() => this.connect(), this.reconnectInterval);
+        this.retryConnection();
       };
 
       this.ws.onerror = (event) => {
-        // Downgrade to warn to avoid cluttering console in dev/demo mode
-        console.warn('Titanium Uplink Unreachable - Running in Offline/Simulation Protocol');
-        this.ws?.close();
+        console.warn('Titanium Uplink Connection Error');
       };
     } catch (e) {
       console.error('Connection failed', e);
+      this.retryConnection();
+    }
+  }
+
+  private retryConnection() {
+    if (this.attempts < this.maxReconnectAttempts) {
+      this.attempts++;
       setTimeout(() => this.connect(), this.reconnectInterval);
+    } else {
+      console.error('Max reconnection attempts reached. Switching to Offline Mode.');
     }
   }
 
